@@ -27,7 +27,7 @@ static const char *TAG = "MAIN_SYSTEM";
 // Bus SPI (MAX6675)
 
 #define PIN_NUM_MISO     GPIO_NUM_19
-#define PIN_NUM_CLK      GPIO_NUM_18g
+#define PIN_NUM_CLK      GPIO_NUM_18
 #define PIN_NUM_MAX_CS   GPIO_NUM_4
 
 // Pines LCD 16x2 Paralela (Modo 4 bits)
