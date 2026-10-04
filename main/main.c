@@ -48,6 +48,10 @@ static const char *TAG = "MAIN_SYSTEM";
 #define PIN_HEATER_RELAY   GPIO_NUM_33
 #define HYSTERESIS         2.0f
 
+// motor y ventilador:
+#define PIN_MOTOR_AGITADOR   GPIO_NUM_2   // Control transistor 2N2222 para motor de espátulas
+#define PIN_VENTILADOR       GPIO_NUM_15  // Control transistor 2N2222 para ventilador
+
 // ==========================================
 
 // 2. ESTRUCTURAS Y HANDLES GLOBALES
@@ -337,12 +341,14 @@ void vTaskSampling(void *pvParameters) {
             sample.temperatura = 0.0f;
         }
 
-        // 3. Lógica de Selección por Botones (si no hay proceso activo)
+    // 3. Lógica de Selección por Botones (si no hay proceso activo)
         if (!sample.en_proceso) {
-            gpio_set_level(PIN_HEATER_RELAY, 0); // Mantener apagado el calentador
+            gpio_set_level(PIN_HEATER_RELAY, 0); 
+            gpio_set_level(PIN_MOTOR_AGITADOR, 0); // Agitador OFF
+            gpio_set_level(PIN_VENTILADOR, 0);     // Ventilador OFF
             sample.heater_on = false;
 
-            if (gpio_get_level(PIN_BTN_1) == 0) { // Presionado (Active LOW)
+            if (gpio_get_level(PIN_BTN_1) == 0) {
                 sample.en_proceso = true;
                 sample.perfil_seleccionado = 1;
                 sample.temp_target = 40.0f;
@@ -361,9 +367,13 @@ void vTaskSampling(void *pvParameters) {
             sample.tiempo_restante_sec = tiempo_total_sec;
         } 
         
-        // 4. Lógica durante el proceso activo (Temporizador y Control de Temperatura)
+        // 4. Lógica durante el proceso activo
         if (sample.en_proceso) {
-            // Control ON/OFF con Histéresis
+            // Activar agitador continuamente durante el tueste
+            gpio_set_level(PIN_MOTOR_AGITADOR, 1);
+            gpio_set_level(PIN_VENTILADOR, 0);
+
+            // Control ON/OFF con Histéresis para la resistencia
             if (!sample.tc_error) {
                 if (sample.temperatura < (sample.temp_target - HYSTERESIS)) {
                     gpio_set_level(PIN_HEATER_RELAY, 1);
@@ -373,7 +383,7 @@ void vTaskSampling(void *pvParameters) {
                     sample.heater_on = false;
                 }
             } else {
-                gpio_set_level(PIN_HEATER_RELAY, 0); // Apagar si falla sensor
+                gpio_set_level(PIN_HEATER_RELAY, 0);
                 sample.heater_on = false;
             }
 
@@ -382,12 +392,23 @@ void vTaskSampling(void *pvParameters) {
                 tiempo_total_sec--;
                 sample.tiempo_restante_sec = tiempo_total_sec;
             } else {
-                // Proceso Finalizado
+                // Proceso Finalizado -> Entrar a estado seguro / Apagado
                 sample.en_proceso = false;
                 gpio_set_level(PIN_HEATER_RELAY, 0);
+                gpio_set_level(PIN_MOTOR_AGITADOR, 0);
+                gpio_set_level(PIN_VENTILADOR, 1); // Puedes encender el ventilador por unos segundos para enfriar
                 sample.heater_on = false;
+                sample.perfil_seleccionado = 0;
             }
         }
+                // --- NUEVAS ACCIONES DE APAGADO ---
+                // 1. Apagar motor agitador (TT)
+                // 2. Apagar ventilador
+                // 3. Mandar señal para subir la lata con el NEMA 17
+
+                // Reiniciar perfil seleccionado para la siguiente ronda
+                sample.perfil_seleccionado = 0;
+            
 
         xQueueSend(sensorQueue, &sample, pdMS_TO_TICKS(50));
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000)); // Periodo exacto de 1 segundo
@@ -402,8 +423,20 @@ void vTaskLCDDisplay(void *pvParameters) {
 
     lcd_init_parallel();
 
+    bool proceso_anterior = false; // Variable local para detectar transición
+
     while (1) {
         if (xQueueReceive(sensorQueue, &data, portMAX_DELAY) == pdTRUE) {
+
+            // Si el proceso acaba de terminar, limpiar pantalla antes de mostrar el menú
+            if (proceso_anterior && !data.en_proceso) {
+                lcd_send_cmd(0x01); // Comando Clear Display
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+
+            proceso_anterior = data.en_proceso;
+
+
             if (!data.en_proceso) {
                 // Modo Selección: Muestra mensaje y la Hora actual
                 lcd_set_cursor(0, 0);
@@ -524,6 +557,22 @@ void app_main(void) {
     };
     gpio_config(&relay_conf);
     gpio_set_level(PIN_HEATER_RELAY, 0); // Apagado por seguridad al inicio
+
+
+        // actuador motor y ventilador
+    gpio_config_t actuadores_conf = {
+        .pin_bit_mask = (1ULL << PIN_MOTOR_AGITADOR) | (1ULL << PIN_VENTILADOR),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&actuadores_conf);
+    
+    // Apagados por defecto al inicio
+    gpio_set_level(PIN_MOTOR_AGITADOR, 0);
+    gpio_set_level(PIN_VENTILADOR, 0);
+
 
     // C. Tareas
 
