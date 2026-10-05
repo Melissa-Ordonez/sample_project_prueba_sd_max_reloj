@@ -9,7 +9,12 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
-
+#include "esp_vfs_fat.h"
+#include "driver/sdspi_host.h"
+#include "sdmmc_cmd.h"
+#include "esp_pm.h"
+#include "esp_private/esp_clk.h"
+#include "soc/rtc.h"
 static const char *TAG = "MAIN_SYSTEM";
 
 // ==========================================
@@ -26,8 +31,8 @@ static const char *TAG = "MAIN_SYSTEM";
 
 // Bus SPI (MAX6675)
 
-#define PIN_NUM_MISO     GPIO_NUM_19
-#define PIN_NUM_CLK      GPIO_NUM_18
+#define PIN_NUM_MISO     GPIO_NUM_19  //MISO / SO lo comparte con la tarjeta SD, pero no hay conflicto porque solo un dispositivo es activo a la vez
+#define PIN_NUM_CLK      GPIO_NUM_18  // SCLK compartido con la tarjeta SD, pero no hay conflicto porque solo un dispositivo es activo a la vez
 #define PIN_NUM_MAX_CS   GPIO_NUM_4
 
 // Pines LCD 16x2 Paralela (Modo 4 bits)
@@ -51,6 +56,11 @@ static const char *TAG = "MAIN_SYSTEM";
 // motor y ventilador:
 #define PIN_MOTOR_AGITADOR   GPIO_NUM_2   // Control transistor 2N2222 para motor de espátulas
 #define PIN_VENTILADOR       GPIO_NUM_15  // Control transistor 2N2222 para ventilador
+
+// Punto de montaje para la tarjeta SD
+#define PIN_NUM_MOSI    23           // Pin MOSI / DI
+#define PIN_NUM_SD_CS   5   // Chip Select exclusivo para el Lector MicroSD 
+#define MOUNT_POINT "/sdcard"
 
 // ==========================================
 
@@ -279,6 +289,53 @@ void lcd_print_string(const char *str) {
 
 }
 
+
+
+// inicializacion de la tarjeta SD y montaje del sistema de archivos FAT
+
+void init_sd_card(void) {
+    esp_err_t ret;
+
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false, // No formatear si hay error para cuidar datos
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024
+    };
+
+    sdmmc_card_t *card;
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+
+    // Configuración del puerto de la Tarjeta SD
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = PIN_NUM_SD_CS; // Pin GPIO 13 para seleccionar la SD
+    slot_config.host_id = host.slot;
+
+    // Montar el sistema de archivos VFS FAT en la MicroSD
+    ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &card);
+
+    if (ret != ESP_OK) {
+        if (ret == ESP_FAIL) {
+            ESP_LOGE("SD", "Error al montar el sistema de archivos FAT.");
+        } else {
+            ESP_LOGE("SD", "Error al inicializar la tarjeta SD (%s).", esp_err_to_name(ret));
+        }
+        return;
+    }
+
+    ESP_LOGI("SD", "Tarjeta MicroSD montada con éxito en %s", MOUNT_POINT);
+
+    // Crear o escribir el encabezado del archivo CSV si es nuevo
+    FILE *f = fopen("/sdcard/tueste.csv", "a");
+    if (f != NULL) {
+        // Escribe la cabecera del archivo si está vacío
+        fseek(f, 0, SEEK_END);
+        if (ftell(f) == 0) {
+            fprintf(f, "Tiempo,Temperatura_Real,Temperatura_Target,Relay_Status\n");
+        }
+        fclose(f);
+    }
+}
+
 // ==========================================
 
 // 5. LECTURA DE MAX6675 (SPI)
@@ -402,9 +459,31 @@ void vTaskSampling(void *pvParameters) {
             }
         }
 
-                // Reiniciar perfil seleccionado para la siguiente ronda
-                sample.perfil_seleccionado = 0;
-            
+                          
+          // 5. Envío de telemetría por Puerto Serial (Formato CSV con Timestamp) si esta conectado a un PC
+        // Imprime: HH:MM:SS, Temperatura, Temp_Target, Heater_ON, Motor_ON, Ventilador_ON
+        printf("%s,%.2f,%.2f,%d,%d,%d\n", 
+               sample.time_str,
+               sample.temperatura,
+               sample.temp_target,
+               sample.heater_on ? 1 : 0,
+               (sample.en_proceso && sample.tiempo_restante_sec > 0) ? 1 : 0, // Agitador
+               (!sample.en_proceso && sample.perfil_seleccionado == 0) ? 1 : 0  // Ventilador
+        );
+
+
+        // --- GUARDADO EN TARJETA SD ---
+        FILE *f = fopen("/sdcard/tueste.csv", "a"); // "a" para append (agregar al final)
+        if (f != NULL) {
+            fprintf(f, "%s,%.2f,%.2f,%d\n", 
+                    sample.time_str,
+                    sample.temperatura,
+                    sample.temp_target,
+                    sample.heater_on ? 1 : 0);
+            fclose(f); // Cerrar inmediatamente para asegurar que los datos se escriban
+        } else {
+            ESP_LOGE("SD", "Error al abrir el archivo tueste.csv");
+        }
 
         xQueueSend(sensorQueue, &sample, pdMS_TO_TICKS(50));
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000)); // Periodo exacto de 1 segundo
@@ -474,6 +553,11 @@ void vTaskLCDDisplay(void *pvParameters) {
 
 void app_main(void) {
 
+    rtc_cpu_freq_config_t max_freq;
+    rtc_clk_cpu_freq_mhz_to_config(80, &max_freq);
+    rtc_clk_cpu_freq_set_config_fast(&max_freq);
+    
+
     ESP_LOGI(TAG, "Iniciando sistema con LCD Paralela...");
 
     sensorQueue = xQueueCreate(5, sizeof(SensorData_t));
@@ -494,6 +578,8 @@ void app_main(void) {
 
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus));
 
+   
+
     i2c_device_config_t rtc_dev_cfg = {
 
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
@@ -508,7 +594,7 @@ void app_main(void) {
 
     spi_bus_config_t spi_bus_cfg = {
 
-        .mosi_io_num = -1,
+        .mosi_io_num = PIN_NUM_MOSI,
         .miso_io_num = PIN_NUM_MISO,
         .sclk_io_num = PIN_NUM_CLK,
         .quadwp_io_num = -1,
@@ -529,6 +615,8 @@ void app_main(void) {
     };
 
     ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &max6675_cfg, &max6675_spi_handle));
+    
+     init_sd_card();
 
     ESP_ERROR_CHECK(ds3231_init_or_update(rtc_dev_handle, false));
 
