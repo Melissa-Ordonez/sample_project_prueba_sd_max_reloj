@@ -401,10 +401,6 @@ void vTaskSampling(void *pvParameters) {
                 sample.perfil_seleccionado = 0;
             }
         }
-                // --- NUEVAS ACCIONES DE APAGADO ---
-                // 1. Apagar motor agitador (TT)
-                // 2. Apagar ventilador
-                // 3. Mandar señal para subir la lata con el NEMA 17
 
                 // Reiniciar perfil seleccionado para la siguiente ronda
                 sample.perfil_seleccionado = 0;
