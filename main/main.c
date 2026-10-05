@@ -1,3 +1,14 @@
+/**
+ * @file main.c
+ * @brief Sistema Autónomo de Control y Telemetría para Tostadora de Café.
+ * @details Este programa ejecuta el control de temperatura por histéresis,
+ *          gestiona perfiles de tueste, registra la telemetría en un archivo CSV
+ *          dentro de una tarjeta MicroSD, actualiza la pantalla LCD Paralela
+ *          y gestiona el reloj RTC DS3231 utilizando FreeRTOS en una ESP32.
+ * 
+ * @date 2026-10-05
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -17,23 +28,21 @@
 #include "soc/rtc.h"
 static const char *TAG = "MAIN_SYSTEM";
 
-// ==========================================
-
-// 1. PINOUT Y CONFIGURACIÓN HARDWARE
-
-// ==========================================
+/* =========================================================================
+ * DEFINICIONES DE HARDWARE Y CONSTANTES
+ * ========================================================================= */
 
 // Bus I2C (DS3231)
 
-#define I2C_SDA_PIN      21
-#define I2C_SCL_PIN      22
-#define DS3231_I2C_ADDR  0x68
+#define I2C_SDA_PIN      21     /**< GPIO para la línea de datos SDA */
+#define I2C_SCL_PIN      22     /**< GPIO para la línea de reloj SCL */
+#define DS3231_I2C_ADDR  0x68   /**< Dirección I2C del RTC DS3231 */
 
 // Bus SPI (MAX6675)
 
-#define PIN_NUM_MISO     GPIO_NUM_19  //MISO / SO lo comparte con la tarjeta SD, pero no hay conflicto porque solo un dispositivo es activo a la vez
-#define PIN_NUM_CLK      GPIO_NUM_18  // SCLK compartido con la tarjeta SD, pero no hay conflicto porque solo un dispositivo es activo a la vez
-#define PIN_NUM_MAX_CS   GPIO_NUM_4
+#define PIN_NUM_MISO     GPIO_NUM_19  /**< GPIO para la línea MISO / SO */
+#define PIN_NUM_CLK      GPIO_NUM_18  /**< GPIO para el Reloj SCK / SCLK */
+#define PIN_NUM_MAX_CS   GPIO_NUM_4   /**< Chip Select exclusivo para el sensor MAX6675 */
 
 // Pines LCD 16x2 Paralela (Modo 4 bits)
 
@@ -45,58 +54,78 @@ static const char *TAG = "MAIN_SYSTEM";
 #define LCD_D7           GPIO_NUM_13
 
 // Botones de selección de perfil
-#define PIN_BTN_1          GPIO_NUM_34  // Perfil 1: 196°C / 11 min
-#define PIN_BTN_2          GPIO_NUM_35  // Perfil 2: 210°C / 13 min
-#define PIN_BTN_3          GPIO_NUM_32  // Perfil 3: 231°C / 15 min
+#define PIN_BTN_1          GPIO_NUM_34  /**< GPIO para el botón de selección del Perfil 1 :196°C */
+#define PIN_BTN_2          GPIO_NUM_35  /**< GPIO para el botón de selección del Perfil 2 :210°C*/
+#define PIN_BTN_3          GPIO_NUM_32  /**< GPIO para el botón de selección del Perfil 3 :231°C*/
 
 // Pin del Relé
-#define PIN_HEATER_RELAY   GPIO_NUM_33
+#define PIN_HEATER_RELAY   GPIO_NUM_33  /**< Relé de control de la resistencia (110V) */
 #define HYSTERESIS         2.0f
 
 // motor y ventilador:
-#define PIN_MOTOR_AGITADOR   GPIO_NUM_2   // Control transistor 2N2222 para motor de espátulas
-#define PIN_VENTILADOR       GPIO_NUM_15  // Control transistor 2N2222 para ventilador
+#define PIN_MOTOR_AGITADOR   GPIO_NUM_2   /**< GPIO para el control del motor de espátulas */
+#define PIN_VENTILADOR       GPIO_NUM_15  /**< GPIO para el control del ventilador */
 
 // Punto de montaje para la tarjeta SD
-#define PIN_NUM_MOSI    23           // Pin MOSI / DI
-#define PIN_NUM_SD_CS   5   // Chip Select exclusivo para el Lector MicroSD 
+#define PIN_NUM_MOSI    23         /**< GPIO para la línea MOSI / DI (Requerido por la SD) */
+#define PIN_NUM_SD_CS   5          /**< Chip Select exclusivo para la tarjeta MicroSD */
 #define MOUNT_POINT "/sdcard"
 
-// ==========================================
+/* =========================================================================
+ * ESTRUCTURAS DE DATOS Y VARIABLES GLOBALES
+ * ========================================================================= */
 
-// 2. ESTRUCTURAS Y HANDLES GLOBALES
-
-// ==========================================
+/**
+ * @brief Estructura de telemetría para compartir datos entre tareas de FreeRTOS.
+ */
 
 typedef struct {
 
-    char time_str[16];   // "HH:MM:SS"
-    char date_str[16];   // "DD/MM/YYYY"
-    float temperatura;
-    bool tc_error;
-    bool heater_on;
+    char time_str[16];  /**< Cadena con la hora formateada HH:MM:SS */
+    char date_str[16];   /**< Cadena con la fecha formateada DD/MM/YYYY */
+    float temperatura;  /**< Lectura actual del sensor de temperatura (°C) */   
+    bool tc_error;      /**< Bandera de falla de lectura en la termocupla */
+    bool heater_on;     /**< Bandera de estado del calentador */
     
     // Estado del proceso
-    bool en_proceso;       // true: ejecutando perfil, false: esperando selección
-    int perfil_seleccionado; // 1, 2 o 3
-    float temp_target;     // 196, 210 o 231 °C
-    int tiempo_restante_sec; // Segundos restantes del proceso
+    bool en_proceso;             /**< Estado del tueste (true: activo, false: reposo) */
+    int perfil_seleccionado;    /**< Perfil de tueste seleccionado (1, 2 o 3) */
+    float temp_target;          /**< Temperatura objetivo del perfil seleccionado (°C) */
+    int tiempo_restante_sec;    /**< Segundos restantes del proceso */
 
 } SensorData_t;
 
+/**
+ * @brief Cola de FreeRTOS para transferir telemetría a la tarea de la pantalla LCD */
 QueueHandle_t sensorQueue;
+
+/** @brief Manejador del dispositivo I2C para el RTC DS3231 */
 i2c_master_dev_handle_t rtc_dev_handle;
+
+/**
+ * @brief Manejador del dispositivo SPI para la termocupla MAX6675 */
 spi_device_handle_t max6675_spi_handle;
 
-// ==========================================
 
-// 3. AUXILIARES RTC DS3231 (I2C)
-
-// ==========================================
-
+/**
+ * @brief Convierte un número en formato BCD (Binary Coded Decimal) a Decimal.
+ * @param[in] val Valor entero en formato BCD.
+ * @return Valor convertido a base decimal de 8 bits (uint8_t).
+ */
 static inline uint8_t bcd2dec(uint8_t val) { return ((val >> 4) * 10) + (val & 0x0F); }
+
+/**
+ * @brief Convierte un número en formato Decimal a BCD (Binary Coded Decimal).
+ * @param[in] val Valor entero en base decimal.
+ * @return Valor convertido a formato BCD de 8 bits (uint8_t).
+ */
 static inline uint8_t dec2bcd(uint8_t val) { return ((val / 10) << 4) | (val % 10); }
 
+/**
+ * @brief Convierte el nombre abreviado de un mes en texto a su número de mes correspondiente (1-12).
+ * @param[in] month_str Cadena de texto con los primeros 3 caracteres del mes en inglés (ej. "Jan", "Feb").
+ * @return Número de mes (1 para Enero hasta 12 para Diciembre). Si no coincide, retorna 1 por defecto.
+ */
 static int parse_month(const char *month_str) {
     const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", 
                             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
@@ -106,9 +135,16 @@ static int parse_month(const char *month_str) {
     return 1;
 }
 
-// Programa la fecha/hora de la PC en el DS3231
-
-// Verifica si el oscilador se detuvo (bit OSF) y solo reprograma si es necesario
+/**
+ * @brief Inicializa o actualiza la fecha y hora del RTC DS3231 según la hora de compilación.
+ * @details Lee el registro de estado (0x0F) para verificar si el bit OSF (Oscillator Stop Flag) está activo.
+ *          Si el reloj perdió energía o si \p force_reset es true, parsea las macros de C `__DATE__` y `__TIME__`
+ *          para reconfigurar el DS3231 vía I2C y limpia la bandera OSF.
+ * 
+ * @param[in] dev_handle Manejador I2C del dispositivo DS3231.
+ * @param[in] force_reset `true` para forzar la reescritura de la hora de compilación; `false` para reescribir únicamente si la batería de respaldo falló.
+ * @return `ESP_OK` si la transacción I2C fue exitosa, o un código de error de ESP-IDF en caso contrario.
+ */
 esp_err_t ds3231_init_or_update(i2c_master_dev_handle_t dev_handle, bool force_reset) {
     uint8_t reg_status = 0x0F;
     uint8_t status_val = 0;
@@ -151,6 +187,15 @@ esp_err_t ds3231_init_or_update(i2c_master_dev_handle_t dev_handle, bool force_r
     return ESP_OK;
 }
 
+/**
+ * @brief Obtiene la fecha y hora actual almacenada en el RTC DS3231.
+ * @details Lee 7 bytes de datos por I2C desde el registro `0x00`, los convierte de BCD a decimal 
+ *          y llena una estructura estándar `struct tm` de la librería `time.h`.
+ * 
+ * @param[in]  dev_handle Manejador I2C del dispositivo DS3231.
+ * @param[out] timeinfo Puntero a la estructura `struct tm` donde se cargarán los datos de fecha/hora.
+ * @return `ESP_OK` si la lectura I2C fue exitosa, o un código de error de ESP-IDF si falla.
+ */
 esp_err_t ds3231_get_time(i2c_master_dev_handle_t dev_handle, struct tm *timeinfo) {
     uint8_t reg_addr = 0x00;
     uint8_t data[7];
@@ -170,12 +215,13 @@ esp_err_t ds3231_get_time(i2c_master_dev_handle_t dev_handle, struct tm *timeinf
 
 }
 
-// ==========================================
 
-// 4. CONTROLADOR PARALELO LCD 16x2 (4 BITS)
-
-// ==========================================
-
+/**
+ * @brief Genera un pulso de habilitación (Enable) para el controlador LCD HD44780.
+ * @details Conmuta la línea LCD_E de ALTO a BAJO para sincronizar el envío de datos 
+ *          o comandos hacia la pantalla LCD Paralela. Incluye retardos en microsegundos 
+ *          para garantizar los tiempos de establecimiento (setup/hold) del bus.
+ */
 void lcd_pulse_enable(void) {
 
     gpio_set_level(LCD_E, 1);
@@ -291,8 +337,10 @@ void lcd_print_string(const char *str) {
 
 
 
-// inicializacion de la tarjeta SD y montaje del sistema de archivos FAT
-
+/**
+ * @brief Inicializa y monta el sistema de archivos VFS FAT en la tarjeta MicroSD.
+ * @details Configura el driver SDSPI y crea la cabecera en el archivo tueste.csv si es nuevo.
+ */
 void init_sd_card(void) {
     esp_err_t ret;
 
@@ -336,12 +384,11 @@ void init_sd_card(void) {
     }
 }
 
-// ==========================================
-
-// 5. LECTURA DE MAX6675 (SPI)
-
-// ==========================================
-
+/**
+ * @brief Lee la temperatura actual desde el módulo MAX6675 vía SPI.
+ * @param[out] temp_out Puntero donde se almacenará el valor de temperatura leído (°C).
+ * @return true si la lectura fue exitosa, false si hay error o la termocupla está desconectada.
+ */
 bool max6675_read_temp(float *temp_out) {
 
     uint16_t raw_data = 0;
@@ -369,11 +416,18 @@ bool max6675_read_temp(float *temp_out) {
 
 }
 
-// ==========================================
+/* =========================================================================
+ * TAREAS DE FREERTOS
+ * ========================================================================= */
 
-// 6. TAREAS FREERTOS
-
-// ==========================================
+/**
+ * @brief Tarea principal de muestreo, control térmico, telemetría y logging en SD.
+ * @details Se ejecuta periódicamente cada 1000 ms. Realiza la lectura de sensores,
+ *          gestiona el algoritmo de control por histéresis, escribe en la tarjeta SD
+ *          y envía la información a la cola de la pantalla LCD.
+ * 
+ * @param[in] pvParameters Parámetros recibidos al crear la tarea (no utilizado).
+ */
 
 void vTaskSampling(void *pvParameters) {
     SensorData_t sample = {0};
@@ -490,8 +544,13 @@ void vTaskSampling(void *pvParameters) {
     }
 }
 
-//-------------------------------------------------------------------------
-
+/**
+ * @brief Tarea encarga de la actualización de la pantalla LCD Paralela.
+ * @details Recibe los datos de la cola `sensorQueue` y formatea la interfaz gráfica
+ *          según el estado del sistema (Menú de Selección o Proceso Activo).
+ * 
+ * @param[in] pvParameters Parámetros recibidos al crear la tarea (no utilizado).
+ */
 void vTaskLCDDisplay(void *pvParameters) {
     SensorData_t data;
     char buffer[24];
@@ -545,11 +604,15 @@ void vTaskLCDDisplay(void *pvParameters) {
     }
 }
 
-// ==========================================
+/* =========================================================================
+ * FUNCIÓN PRINCIPAL (ENTRY POINT)
+ * ========================================================================= */
 
-// 7. INICIALIZACIÓN GENERAL
-
-// ==========================================
+/**
+ * @brief Punto de entrada principal de la aplicación en ESP-IDF.
+ * @details Configura la frecuencia del reloj, inicializa la cola de FreeRTOS, los buses I2C y SPI,
+ *          configura los GPIOs de actuadores y botones, e inicia las tareas del planificador.
+ */
 
 void app_main(void) {
 
